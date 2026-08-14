@@ -1,0 +1,98 @@
+name: Orion weekly upstream sync
+
+on:
+  schedule:
+    # Monday 06:00 UTC = Monday 09:00 UTC+3.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: orion-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Create or update upstream synchronization PR
+    runs-on: ubuntu-latest
+    env:
+      # A fine-grained PAT is required so the PR push triggers the normal CI workflows.
+      ORION_SYNC_TOKEN: ${{ secrets.ORION_UPSTREAM_SYNC_TOKEN }}
+      SYNC_BRANCH: chore/sync-twenty-upstream
+      UPSTREAM_REPOSITORY: https://github.com/twentyhq/twenty.git
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify synchronization token
+        shell: bash
+        run: |
+          if [[ -z "${ORION_SYNC_TOKEN}" ]]; then
+            echo "::error::Repository secret ORION_UPSTREAM_SYNC_TOKEN is required. Add a fine-grained GitHub token with Contents: Read and write, Pull requests: Read and write, and Metadata: Read permissions for this repository."
+            exit 1
+          fi
+
+      - name: Merge upstream and create or update Pull Request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ORION_UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BASE_BRANCH="${{ github.event.repository.default_branch }}"
+          git config user.name "orion-upstream-sync[bot]"
+          git config user.email "orion-upstream-sync[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "${UPSTREAM_REPOSITORY}"
+          else
+            git remote add upstream "${UPSTREAM_REPOSITORY}"
+          fi
+
+          git fetch origin "${BASE_BRANCH}"
+          git fetch upstream main --tags
+          git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream/main is already included in ${BASE_BRANCH}; no synchronization PR is needed."
+            exit 0
+          fi
+
+          git merge --no-edit upstream/main
+
+          git remote set-url origin "https://x-access-token:${ORION_SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+          PR_TITLE="chore: sync Twenty upstream"
+          PR_BODY=$(cat <<'EOF'
+          This Pull Request is maintained automatically by the weekly Orion upstream synchronization workflow.
+
+          It merges the current `twentyhq/twenty` `main` branch into Orion. Review the change set and wait for the required CI checks before merging. This workflow never merges changes directly into `main`.
+
+          If a merge conflict occurs, the workflow fails without changing `main`; resolve the conflict in this PR branch and continue the review.
+          EOF
+          )
+
+          EXISTING_PR=$(gh pr list \
+            --head "${SYNC_BRANCH}" \
+            --base "${BASE_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [[ -n "${EXISTING_PR}" ]]; then
+            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}"
+            echo "Updated Pull Request #${EXISTING_PR}."
+          else
+            gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "${PR_TITLE}" \
+              --body "${PR_BODY}"
+          fi
